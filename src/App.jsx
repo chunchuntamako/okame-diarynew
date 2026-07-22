@@ -208,6 +208,8 @@ async function callPipoComment({ bird, weight, energy, appetite, rotationAnswers
 function RecordScreen({ initial, onSave, onBack }) {
   const { bird } = useBird();
   const [photo, setPhoto] = useState(initial?.photo || null);
+  const [photoUploading, setPhotoUploading] = useState(false);
+  const [photoError, setPhotoError] = useState('');
   const [weight, setWeight] = useState(initial?.weight || '');
   const [energy, setEnergy] = useState(initial?.energy || null);
   const [appetite, setAppetite] = useState(initial?.appetite || null);
@@ -250,6 +252,17 @@ function RecordScreen({ initial, onSave, onBack }) {
       alert_signals: hasSafetyAlert ? safetySignals : null,
     });
     if (rows && rows[0]) setSavedLogId(rows[0].id);
+
+    // 実際にアップロードされた写真（URL）があれば、アルバムに出るようphotosテーブルにも保存する
+    if (photo && (photo.startsWith('http') || photo.startsWith('data:'))) {
+      await supabaseInsert('photos', {
+        bird_id: bird.id,
+        photo_date: today,
+        image_url: photo,
+        caption: ownerComment || null,
+        is_milestone: false,
+      }).catch(() => {}); // 失敗しても記録自体は続行する
+    }
   };
 
   const handleSaveClick = async () => {
@@ -310,10 +323,41 @@ function RecordScreen({ initial, onSave, onBack }) {
       <div className="ruled-card today-card">
         <PunchHoles />
         <div className="ruled-card-body">
-          <button className="photo-well photo-well-lg" onClick={() => setPhoto((p) => (p ? null : PHOTO_TONES[0]))}>
-            {photo ? (
-              <div className="photo-well-img" style={{ background: photo }}>
-                <span className="photo-well-tag">今日撮った1枚</span>
+          <input
+            type="file"
+            accept="image/*"
+            id="photo-file-input"
+            style={{ display: 'none' }}
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              setPhotoError('');
+              setPhotoUploading(true);
+              try {
+                const url = await supabaseUploadPhoto(file);
+                setPhoto(url);
+              } catch (err) {
+                setPhotoError(err.message || String(err));
+              } finally {
+                setPhotoUploading(false);
+                e.target.value = '';
+              }
+            }}
+          />
+          <button
+            className="photo-well photo-well-lg"
+            onClick={() => {
+              if (photo) { setPhoto(null); return; }
+              document.getElementById('photo-file-input').click();
+            }}
+          >
+            {photoUploading ? (
+              <div className="photo-well-empty">
+                <span>アップロード中…</span>
+              </div>
+            ) : photo ? (
+              <div className="photo-well-img" style={photoBackgroundStyle(photo)}>
+                <span className="photo-well-tag">今日撮った1枚（タップで削除）</span>
               </div>
             ) : (
               <div className="photo-well-empty">
@@ -322,6 +366,7 @@ function RecordScreen({ initial, onSave, onBack }) {
               </div>
             )}
           </button>
+          {photoError ? <span className="ai-error-note">{photoError}</span> : null}
 
           <div className="safety-block">
             <span className="field-label safety-label"><AlertTriangle size={12} strokeWidth={2.4} /> 気になるサインはありますか？（該当すれば選択）</span>
@@ -509,7 +554,7 @@ function TodayStatusCard({ record, onOpenRecord }) {
       <div className="ruled-card-body">
         <div className="today-done-row">
           {record.photo ? (
-            <div className="polaroid polaroid-sm today-done-photo"><div className="polaroid-photo" style={{ background: record.photo }} /></div>
+            <div className="polaroid polaroid-sm today-done-photo"><div className="polaroid-photo" style={photoBackgroundStyle(record.photo)} /></div>
           ) : (
             <div className="today-done-noPhoto"><KirieCockatiel /></div>
           )}
@@ -755,6 +800,34 @@ async function supabaseInsert(table, payload) {
   return res.json();
 }
 
+async function supabaseUploadPhoto(file) {
+  const ext = file.name.split('.').pop() || 'jpg';
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/photos/${path}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': file.type || 'image/jpeg',
+    },
+    body: file,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`写真のアップロードに失敗: ${res.status} ${text}`);
+  }
+  return `${SUPABASE_URL}/storage/v1/object/public/photos/${path}`;
+}
+
+// photo が本物のURL（アップロード済み）か、見本用の色（グラデーション文字列）かを判定して表示スタイルを作る
+function photoBackgroundStyle(value) {
+  if (!value) return {};
+  if (value.startsWith('http') || value.startsWith('data:')) {
+    return { backgroundImage: `url(${value})`, backgroundSize: 'cover', backgroundPosition: 'center' };
+  }
+  return { background: value };
+}
+
 async function supabaseUpdate(table, id, patch) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, {
     method: 'PATCH',
@@ -868,7 +941,7 @@ function AlbumThrowback({ photos }) {
       <span className="washi-tape" />
       <div className="washi-card-row">
         <div className="polaroid polaroid-md tilt-l">
-          <div className="polaroid-photo" style={{ background: pick.tone || PHOTO_TONES[0] }} />
+          <div className="polaroid-photo" style={photoBackgroundStyle(pick.image_url || pick.tone || PHOTO_TONES[0])} />
         </div>
         <div className="washi-card-text">
           <span className="eyebrow">今日のちゅんこ · {pick.photo_date.slice(5).replace('-', '/')}</span>
@@ -929,7 +1002,7 @@ function AlbumTab() {
                 {items.map((p, i) => (
                   <div className={`polaroid polaroid-grid ${i % 2 === 0 ? 'tilt-l' : 'tilt-r'} ${p.is_milestone ? 'is-milestone' : ''}`} key={p.id}>
                     {p.is_milestone ? <span className="washi-tape album-tape" /> : null}
-                    <div className="polaroid-photo" style={{ background: p.tone || PHOTO_TONES[0] }} />
+                    <div className="polaroid-photo" style={photoBackgroundStyle(p.image_url || p.tone || PHOTO_TONES[0])} />
                     <span className="polaroid-cap">{p.photo_date.slice(5).replace('-', '/')}</span>
                     {p.caption ? <p className="album-caption">{p.caption}</p> : null}
                   </div>
@@ -1249,7 +1322,7 @@ function HomeHero({ record, onOpenRecord, onSeeWeight }) {
   const memoryPick = memoryPhotos && memoryPhotos.length > 0
     ? memoryPhotos[Math.floor(Math.random() * memoryPhotos.length)]
     : null;
-  const heroTone = record?.photo || memoryPick?.tone || null;
+  const heroTone = record?.photo || memoryPick?.image_url || memoryPick?.tone || null;
   const isMemory = !record?.photo && memoryPick;
 
   const d = AI_COMMENT_DEMO[demo];
@@ -1271,7 +1344,7 @@ function HomeHero({ record, onOpenRecord, onSeeWeight }) {
 
       <button className="hero-photo" onClick={onOpenRecord}>
         {heroTone ? (
-          <div className="hero-photo-img" style={{ background: heroTone }}>
+          <div className="hero-photo-img" style={photoBackgroundStyle(heroTone)}>
             {isMemory ? <span className="hero-photo-tag">思い出の1枚</span> : <span className="hero-photo-tag">今日撮った1枚</span>}
           </div>
         ) : (
