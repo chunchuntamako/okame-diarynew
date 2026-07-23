@@ -33,6 +33,17 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Install tomo-notify-web dependencies
+        run: npm ci
+        working-directory: tomo-notify-web
+
+      - name: Build tomo-notify-web
+        run: npm run build
+        working-directory: tomo-notify-web
+
+      - name: Merge tomo-notify-web into dist
+        run: cp -r tomo-notify-web/dist dist/tomo-notify-web
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
