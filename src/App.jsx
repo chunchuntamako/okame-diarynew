@@ -1133,6 +1133,7 @@ function AlbumTab() {
 function LogTab({ onEditEntry }) {
   const { bird } = useBird();
   const [logs, setLogs] = useState(null);
+  const [chartRange, setChartRange] = useState('month'); // 'month' | 'year' | 'all'
 
   useEffect(() => {
     if (!bird?.id) return;
@@ -1143,14 +1144,26 @@ function LogTab({ onEditEntry }) {
       .catch(() => { if (!done) { done = true; clearTimeout(timeout); setLogs([]); } });
   }, [bird?.id]);
 
-  const realWeights = logs ? logs.filter((l) => l.weight_g != null).map((l) => Number(l.weight_g)) : [];
-  const hasRealWeights = realWeights.length > 0;
+  const allWithWeight = logs ? logs.filter((l) => l.weight_g != null) : [];
+  const hasRealWeights = allWithWeight.length > 0;
+
+  // 表示範囲でしぼり込む（最新の記録日を基準に、直近1ヶ月/1年/全期間）
+  const rangedLogs = (() => {
+    if (!hasRealWeights || chartRange === 'all') return allWithWeight;
+    const newest = new Date(allWithWeight[0].log_date);
+    const days = chartRange === 'month' ? 31 : 366;
+    const cutoff = new Date(newest);
+    cutoff.setDate(cutoff.getDate() - days);
+    return allWithWeight.filter((l) => new Date(l.log_date) >= cutoff);
+  })();
+
+  const realWeights = rangedLogs.map((l) => Number(l.weight_g));
   const chartData = hasRealWeights
-    ? [...logs].filter((l) => l.weight_g != null).reverse().map((l) => ({ d: l.log_date.slice(5).replace('-', '/'), w: Number(l.weight_g) }))
+    ? [...rangedLogs].reverse().map((l) => ({ d: l.log_date.slice(5).replace('-', '/'), w: Number(l.weight_g) }))
     : WEIGHT_DATA;
-  const statMax = hasRealWeights ? Math.max(...realWeights) : null;
-  const statMin = hasRealWeights ? Math.min(...realWeights) : null;
-  const statAvg = hasRealWeights ? (realWeights.reduce((a, b) => a + b, 0) / realWeights.length).toFixed(1) : null;
+  const statMax = realWeights.length > 0 ? Math.max(...realWeights) : null;
+  const statMin = realWeights.length > 0 ? Math.min(...realWeights) : null;
+  const statAvg = realWeights.length > 0 ? (realWeights.reduce((a, b) => a + b, 0) / realWeights.length).toFixed(1) : null;
 
   const monthGroups = logs && logs.length > 0
     ? Object.entries(
@@ -1172,7 +1185,14 @@ function LogTab({ onEditEntry }) {
       <div className="ruled-card">
         <PunchHoles />
         <div className="ruled-card-body">
-          <span className="field-label"><Weight size={12} strokeWidth={2.4} /> 体重{hasRealWeights ? '（全期間）' : '（見本）'}</span>
+          <span className="field-label"><Weight size={12} strokeWidth={2.4} /> 体重{hasRealWeights ? `（${chartRange === 'month' ? '直近1ヶ月' : chartRange === 'year' ? '直近1年' : '全期間'}）` : '（見本）'}</span>
+          {hasRealWeights ? (
+            <div className="chart-range-tabs">
+              <button className={chartRange === 'month' ? 'is-active' : ''} onClick={() => setChartRange('month')}>月</button>
+              <button className={chartRange === 'year' ? 'is-active' : ''} onClick={() => setChartRange('year')}>年</button>
+              <button className={chartRange === 'all' ? 'is-active' : ''} onClick={() => setChartRange('all')}>全期間</button>
+            </div>
+          ) : null}
           <ResponsiveContainer width="100%" height={140}>
             <LineChart data={chartData} margin={{ top: 6, right: 6, left: -22, bottom: 0 }}>
               <XAxis dataKey="d" tick={{ fontSize: 10, fill: '#8A8272' }} axisLine={false} tickLine={false} />
@@ -1684,6 +1704,7 @@ const CSS = `
 }
 
 * { box-sizing: border-box; }
+html, body { overflow-x: hidden; max-width: 100%; }
 .app-wrap {
   font-family: 'Zen Kaku Gothic New', sans-serif;
   color: var(--ink);
@@ -1692,6 +1713,8 @@ const CSS = `
   padding: 0;
   background: radial-gradient(circle at 50% 0%, #E8E1D2 0%, #D2C9B7 100%);
   min-height: 100vh;
+  overflow-x: hidden;
+  max-width: 100vw;
 }
 .phone {
   width: 100%;
@@ -1701,11 +1724,11 @@ const CSS = `
   background: var(--bg);
   border-radius: 0;
   box-shadow: none;
-  overflow: hidden;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
 }
-.content { flex: 1; overflow-y: auto; min-height: 0; }
+.content { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; }
 .screen { padding: 22px 14px 24px; }
 
 .eyebrow { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--cheek-deep); font-weight: 700; }
@@ -1737,7 +1760,7 @@ const CSS = `
   display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px;
   border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; background: var(--surface-alt);
 }
-.date-picker-row input { border: none; background: transparent; font-size: 13px; color: var(--ink); font-family: 'Zen Kaku Gothic New', sans-serif; }
+.date-picker-row input { border: none; background: transparent; font-size: 13px; color: var(--ink); font-family: 'Zen Kaku Gothic New', sans-serif; min-width: 0; max-width: 140px; }
 
 /* --- ホーム: 未記録の誘導カード --- */
 .today-prompt { border: none; padding: 0; text-align: left; width: 100%; cursor: pointer; font-family: inherit; }
@@ -2009,7 +2032,7 @@ const CSS = `
 .ai-comment-bubble svg { flex-shrink: 0; margin-top: 2px; }
 
 /* --- タブバー --- */
-.content { flex: 1; overflow-y: auto; }
+.content { flex: 1; overflow-y: auto; overflow-x: hidden; }
 .tabbar { display: flex; border-top: 1px solid var(--line); background: var(--surface); }
 .tab {
   flex: 1; border: none; background: none; padding: 10px 0 13px; display: flex; flex-direction: column;
@@ -2059,6 +2082,12 @@ const CSS = `
 .log-stat { font-size: 11.5px; color: var(--ink-soft); background: var(--surface-alt); border-radius: 999px; padding: 4px 10px; }
 .log-stat strong { color: var(--cheek-deep); margin-left: 3px; }
 .log-months { display: flex; flex-direction: column; gap: 20px; }
+.chart-range-tabs { display: flex; gap: 6px; }
+.chart-range-tabs button {
+  flex: 1; border: 1px solid var(--line); background: var(--surface-alt); color: var(--ink-soft);
+  border-radius: 999px; padding: 6px 4px; font-size: 12px; cursor: pointer; font-family: 'Zen Kaku Gothic New', sans-serif;
+}
+.chart-range-tabs button.is-active { background: var(--cheek); border-color: var(--cheek); color: #fff; font-weight: 700; }
 
 /* --- プロフィールフォーム --- */
 .profile-form { gap: 12px; }
