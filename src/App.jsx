@@ -1696,7 +1696,8 @@ const CSS = `
 .phone {
   width: 100%;
   max-width: 420px;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
   background: var(--bg);
   border-radius: 0;
   box-shadow: none;
@@ -1704,7 +1705,7 @@ const CSS = `
   display: flex;
   flex-direction: column;
 }
-.content { flex: 1; overflow-y: auto; }
+.content { flex: 1; overflow-y: auto; min-height: 0; }
 .screen { padding: 22px 14px 24px; }
 
 .eyebrow { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--cheek-deep); font-weight: 700; }
@@ -2086,7 +2087,7 @@ const CSS = `
 }
 
 @media (min-width: 480px) {
-  .phone { border-radius: 30px; box-shadow: 0 30px 60px -20px rgba(44, 38, 32, 0.35), 0 0 0 9px #2B2820; min-height: 780px; }
+  .phone { border-radius: 30px; box-shadow: 0 30px 60px -20px rgba(44, 38, 32, 0.35), 0 0 0 9px #2B2820; height: min(780px, calc(100vh - 48px)); }
   .app-wrap { padding: 24px 12px; }
 }
 `;
