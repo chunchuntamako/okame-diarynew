@@ -6,9 +6,82 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'rec
 const SUPABASE_URL = 'https://wqjzeewsitghgvfsxskv.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_AlGNwi1FHnqBWvKWAlqFqQ_t1cYVoiD';
 
+/* ---- 認証（自分専用アプリなのでログイン済みユーザーだけがデータにアクセスできる） ---- */
+const AUTH_STORAGE_KEY = 'okame_auth_session_v1';
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(session) {
+  if (session) localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+  else localStorage.removeItem(AUTH_STORAGE_KEY);
+}
+
+function toSession(tokenResponse) {
+  return {
+    access_token: tokenResponse.access_token,
+    refresh_token: tokenResponse.refresh_token,
+    expires_at: Date.now() + (tokenResponse.expires_in || 3600) * 1000,
+  };
+}
+
+async function authLogin(email, password) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error_description || data.msg || 'ログインに失敗しました');
+  const session = toSession(data);
+  saveSession(session);
+  return session;
+}
+
+async function authRefresh(refresh_token) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST',
+    headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const session = toSession(data);
+  saveSession(session);
+  return session;
+}
+
+function authLogout() {
+  saveSession(null);
+}
+
+// 有効なアクセストークンを返す。期限が近ければ自動でリフレッシュする。未ログインならnull
+async function getAccessToken() {
+  const session = loadSession();
+  if (!session) return null;
+  if (session.expires_at - Date.now() > 60_000) return session.access_token;
+  const refreshed = await authRefresh(session.refresh_token).catch(() => null);
+  if (!refreshed) {
+    authLogout();
+    return null;
+  }
+  return refreshed.access_token;
+}
+
+async function authHeaders(extra = {}) {
+  const token = await getAccessToken();
+  return { apikey: SUPABASE_KEY, Authorization: `Bearer ${token || SUPABASE_KEY}`, ...extra };
+}
+
 async function supabaseSelect(table, query = '') {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, {
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    headers: await authHeaders(),
   });
   if (!res.ok) throw new Error(`Supabase fetch failed: ${res.status}`);
   return res.json();
@@ -107,6 +180,12 @@ const MEMORY_TIERS = [
 ];
 const DAYS_RECORDED = 210;
 
+const WEEKDAY_JP = ['日', '月', '火', '水', '木', '金', '土'];
+function formatTodayJp() {
+  const d = new Date();
+  return `${d.getMonth() + 1}月${d.getDate()}日（${WEEKDAY_JP[d.getDay()]}）`;
+}
+
 /* ---- 部品 ---- */
 
 function PunchHoles() {
@@ -186,11 +265,7 @@ async function callPipoComment({ bird, weight, energy, appetite, rotationAnswers
   try {
     response = await fetch(EDGE_FUNCTION_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-      },
+      headers: await authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ birdId: bird.id, weight, energy, appetite, rotationAnswers, ownerComment }),
     });
   } catch (e) {
@@ -207,6 +282,8 @@ async function callPipoComment({ bird, weight, energy, appetite, rotationAnswers
 
 function RecordScreen({ initial, onSave, onBack }) {
   const { bird } = useBird();
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const [logDate, setLogDate] = useState(initial?.logDate || todayStr);
   const [photo, setPhoto] = useState(initial?.photo || null);
   const [photoUploading, setPhotoUploading] = useState(false);
   const [photoError, setPhotoError] = useState('');
@@ -220,8 +297,9 @@ function RecordScreen({ initial, onSave, onBack }) {
   const [aiState, setAiState] = useState('idle'); // 'idle' | 'loading' | 'done' | 'error'
   const [showPrev, setShowPrev] = useState(false);
   const [voice, setVoice] = useState(false);
+  const [dateLookupState, setDateLookupState] = useState('idle'); // 'idle' | 'loading' | 'found' | 'empty'
 
-  const todayCategories = ROTATION_SCHEDULE[new Date().getDay()] || [];
+  const todayCategories = ROTATION_SCHEDULE[new Date(logDate).getDay()] || [];
   const setRotationAnswer = (cat, val) => setRotationAnswers((r) => ({ ...r, [cat]: val }));
 
   // Safety Layer: 命に関わるサインは、AIより先にここで機械的に判定する
@@ -234,14 +312,40 @@ function RecordScreen({ initial, onSave, onBack }) {
   const [aiError, setAiError] = useState('');
   const [hasSaved, setHasSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
-  const [savedLogId, setSavedLogId] = useState(null);
+  const [savedLogId, setSavedLogId] = useState(initial?.logId || null);
+
+  // 日付を選び直した時、その日の記録が既にあれば読み込んで「編集」に切り替える
+  useEffect(() => {
+    if (!bird?.id || logDate === initial?.logDate) return; // 編集モードで開いた直後の初回はスキップ
+    setDateLookupState('loading');
+    supabaseSelect('daily_logs', `select=*&bird_id=eq.${bird.id}&log_date=eq.${logDate}&limit=1`)
+      .then((rows) => {
+        if (rows && rows[0]) {
+          const r = rows[0];
+          setSavedLogId(r.id);
+          setWeight(r.weight_g != null ? String(r.weight_g) : '');
+          setEnergy(r.energy_level || null);
+          setAppetite(r.appetite || null);
+          setOwnerComment(r.owner_comment || '');
+          setAiComment(r.ai_comment || '');
+          setRotationAnswers(r.rotation_category ? { [r.rotation_category]: r.rotation_answer } : {});
+          setSafetySignals(r.alert_signals || []);
+          setDateLookupState('found');
+        } else {
+          setSavedLogId(null);
+          setWeight(''); setEnergy(null); setAppetite(null); setOwnerComment('');
+          setAiComment(''); setRotationAnswers({}); setSafetySignals([]);
+          setDateLookupState('empty');
+        }
+      })
+      .catch(() => setDateLookupState('empty'));
+  }, [logDate, bird?.id]);
 
   const persistToSupabase = async () => {
-    const today = new Date().toISOString().slice(0, 10);
     const rotCat = Object.keys(rotationAnswers)[0] || null;
-    const rows = await supabaseInsert('daily_logs', {
+    const payload = {
       bird_id: bird.id,
-      log_date: today,
+      log_date: logDate,
       owner_comment: ownerComment || null,
       ai_comment: aiComment || null,
       weight_g: weight === '' ? null : Number(weight),
@@ -250,14 +354,19 @@ function RecordScreen({ initial, onSave, onBack }) {
       rotation_category: rotCat,
       rotation_answer: rotCat ? rotationAnswers[rotCat] : null,
       alert_signals: hasSafetyAlert ? safetySignals : null,
-    });
-    if (rows && rows[0]) setSavedLogId(rows[0].id);
+    };
+    if (savedLogId) {
+      await supabaseUpdate('daily_logs', savedLogId, payload);
+    } else {
+      const rows = await supabaseInsert('daily_logs', payload);
+      if (rows && rows[0]) setSavedLogId(rows[0].id);
+    }
 
     // 実際にアップロードされた写真（URL）があれば、アルバムに出るようphotosテーブルにも保存する
     if (photo && (photo.startsWith('http') || photo.startsWith('data:'))) {
       await supabaseInsert('photos', {
         bird_id: bird.id,
-        photo_date: today,
+        photo_date: logDate,
         image_url: photo,
         caption: ownerComment || null,
         is_milestone: false,
@@ -315,10 +424,16 @@ function RecordScreen({ initial, onSave, onBack }) {
       <div className="record-head">
         <button className="back-btn" onClick={onBack} aria-label="戻る"><ChevronLeft size={20} /></button>
         <div>
-          <span className="eyebrow">7月15日（水）</span>
-          <h1>今日を記録</h1>
+          <span className="eyebrow">{logDate === todayStr ? '今日' : '過去の記録'}</span>
+          <h1>{logDate === todayStr ? '今日を記録' : `${logDate.slice(5).replace('-', '/')}を記録`}</h1>
         </div>
       </div>
+
+      <label className="date-picker-row">
+        <span className="field-label">記録する日</span>
+        <input type="date" value={logDate} max={todayStr} onChange={(e) => setLogDate(e.target.value)} />
+      </label>
+      {dateLookupState === 'found' ? <span className="ai-cached-note">この日の記録を読み込みました（編集モード）</span> : null}
 
       <div className="ruled-card today-card">
         <PunchHoles />
@@ -427,7 +542,7 @@ function RecordScreen({ initial, onSave, onBack }) {
           {!hasSaved ? (
             <>
               <button className="btn-primary btn-block" onClick={handleSaveClick}>
-                <Check size={15} strokeWidth={2.6} /> 記録する
+                <Check size={15} strokeWidth={2.6} /> {savedLogId ? '更新する' : '記録する'}
               </button>
               {saveError ? <span className="ai-error-note">保存できませんでした: {saveError}</span> : null}
             </>
@@ -788,12 +903,10 @@ function MemoryStaircase() {
 async function supabaseInsert(table, payload) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
+    headers: await authHeaders({
       'Content-Type': 'application/json',
       Prefer: 'return=representation',
-    },
+    }),
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`Supabase insert failed: ${res.status}`);
@@ -805,11 +918,7 @@ async function supabaseUploadPhoto(file) {
   const path = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/photos/${path}`, {
     method: 'POST',
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': file.type || 'image/jpeg',
-    },
+    headers: await authHeaders({ 'Content-Type': file.type || 'image/jpeg' }),
     body: file,
   });
   if (!res.ok) {
@@ -831,12 +940,10 @@ function photoBackgroundStyle(value) {
 async function supabaseUpdate(table, id, patch) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, {
     method: 'PATCH',
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
+    headers: await authHeaders({
       'Content-Type': 'application/json',
       Prefer: 'return=representation',
-    },
+    }),
     body: JSON.stringify(patch),
   });
   if (!res.ok) throw new Error(`Supabase update failed: ${res.status}`);
@@ -1023,7 +1130,7 @@ function AlbumTab() {
 }
 
 /* ---- 記録タブ（過去の履歴） ---- */
-function LogTab() {
+function LogTab({ onEditEntry }) {
   const { bird } = useBird();
   const [logs, setLogs] = useState(null);
 
@@ -1031,7 +1138,7 @@ function LogTab() {
     if (!bird?.id) return;
     let done = false;
     const timeout = setTimeout(() => { if (!done) { done = true; setLogs([]); } }, 6000); // 6秒で応答なければ諦めて空表示に
-    supabaseSelect('daily_logs', `select=*&bird_id=eq.${bird.id}&order=log_date.desc&limit=60`)
+    supabaseSelect('daily_logs', `select=*&bird_id=eq.${bird.id}&order=log_date.desc&limit=500`)
       .then((rows) => { if (!done) { done = true; clearTimeout(timeout); setLogs(rows); } })
       .catch(() => { if (!done) { done = true; clearTimeout(timeout); setLogs([]); } });
   }, [bird?.id]);
@@ -1104,7 +1211,7 @@ function LogTab() {
               <span className="album-month-label">{month.replace('-', '年')}月</span>
               <div className="binder-spine">
                 {items.map((l) => (
-                  <div className="binder-entry" key={l.id}>
+                  <button className="binder-entry binder-entry-clickable" key={l.id} onClick={() => onEditEntry(l)}>
                     <PunchHoles vertical />
                     <div className="binder-entry-body">
                       <div className="binder-entry-head">
@@ -1128,7 +1235,7 @@ function LogTab() {
                         </div>
                       ) : null}
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>
@@ -1299,6 +1406,10 @@ function ProfileTab() {
       <button className="btn-primary btn-block" onClick={handleSave} disabled={saveState === 'saving'}>
         {saveState === 'saving' ? '保存中…' : saveState === 'saved' ? '保存しました✓' : saveState === 'error' ? 'エラー・もう一度' : '保存する'}
       </button>
+
+      <button className="btn-block" style={{ marginTop: 12 }} onClick={() => { authLogout(); window.location.reload(); }}>
+        ログアウト
+      </button>
     </div>
   );
 }
@@ -1308,6 +1419,17 @@ function HomeHero({ record, onOpenRecord, onSeeWeight }) {
   const { bird } = useBird();
   const [memoryPhotos, setMemoryPhotos] = useState(null);
   const [demo, setDemo] = useState('ok');
+  const [recentWeights, setRecentWeights] = useState(null); // null=読込中, []=データなし
+
+  useEffect(() => {
+    if (!bird?.id) return;
+    let done = false;
+    const timeout = setTimeout(() => { if (!done) { done = true; setRecentWeights([]); } }, 6000);
+    supabaseSelect('daily_logs', `select=log_date,weight_g&bird_id=eq.${bird.id}&weight_g=not.is.null&order=log_date.desc&limit=2`)
+      .then((rows) => { if (!done) { done = true; clearTimeout(timeout); setRecentWeights(rows); } })
+      .catch(() => { if (!done) { done = true; clearTimeout(timeout); setRecentWeights([]); } });
+    return () => { done = true; clearTimeout(timeout); };
+  }, [bird?.id]);
 
   useEffect(() => {
     if (!bird?.id || record?.photo) return;
@@ -1330,15 +1452,16 @@ function HomeHero({ record, onOpenRecord, onSeeWeight }) {
     ? d.comment
     : `おかえり、ピポだよ。今日の${bird.name}はどんな様子だったピポ？`;
 
-  const yesterday = WEIGHT_DATA[WEIGHT_DATA.length - 2].w;
-  const todayW = TODAY_WEIGHT;
-  const diff = (todayW - yesterday).toFixed(1);
-  const diffLabel = diff > 0 ? `昨日より+${diff}g` : diff < 0 ? `昨日より${diff}g` : '昨日と変わらず';
+  const hasRealWeight = recentWeights && recentWeights.length > 0;
+  const todayW = hasRealWeight ? Number(recentWeights[0].weight_g) : (record?.weight ? Number(record.weight) : null);
+  const yesterday = hasRealWeight && recentWeights[1] ? Number(recentWeights[1].weight_g) : null;
+  const diff = (todayW != null && yesterday != null) ? (todayW - yesterday).toFixed(1) : null;
+  const diffLabel = diff == null ? '前回の記録待ち' : diff > 0 ? `前回より+${diff}g` : diff < 0 ? `前回より${diff}g` : '前回と変わらず';
 
   return (
     <div className="screen home-hero-screen">
       <header className="page-head">
-        <span className="eyebrow">7月15日（水）</span>
+        <span className="eyebrow">{formatTodayJp()}</span>
         <h1>今日の{bird.name}</h1>
       </header>
 
@@ -1362,7 +1485,7 @@ function HomeHero({ record, onOpenRecord, onSeeWeight }) {
 
       <button className="home-weight-line" onClick={onSeeWeight}>
         <Weight size={13} strokeWidth={2.4} />
-        <span className="home-weight-num">{todayW}g</span>
+        <span className="home-weight-num">{todayW != null ? `${todayW}g` : 'まだ記録なし'}</span>
         <span className="home-weight-diff">{diffLabel}</span>
         <span className="home-weight-more">グラフを見る →</span>
       </button>
@@ -1390,6 +1513,35 @@ function AppInner() {
   const [tab, setTab] = useState('home'); // 'home' | 'album' | 'log' | 'profile'
   const [view, setView] = useState('home'); // ホームタブ内: 'home' | 'record'
   const [record, setRecord] = useState(null); // 今日の記録（未記録ならnull）
+  const [editingEntry, setEditingEntry] = useState(null); // 記録タブから編集中の過去の記録（無ければnull）
+
+  const openEditEntry = (l) => {
+    setEditingEntry({
+      logDate: l.log_date,
+      logId: l.id,
+      weight: l.weight_g != null ? String(l.weight_g) : '',
+      energy: l.energy_level || null,
+      appetite: l.appetite || null,
+      rotationAnswers: l.rotation_category ? { [l.rotation_category]: l.rotation_answer } : {},
+      text: l.owner_comment || '',
+      aiComment: l.ai_comment || '',
+      safetySignals: l.alert_signals || [],
+      photo: null,
+    });
+    setTab('home');
+    setView('record');
+  };
+
+  const closeRecordScreen = (savedRecord) => {
+    if (editingEntry) {
+      setEditingEntry(null);
+      setTab('log');
+      setView('home');
+    } else {
+      if (savedRecord) setRecord(savedRecord);
+      setView('home');
+    }
+  };
 
   if (tab === 'home' && view === 'record') {
     return (
@@ -1398,9 +1550,9 @@ function AppInner() {
         <div className="phone">
           <div className="content">
             <RecordScreen
-              initial={record}
-              onBack={() => setView('home')}
-              onSave={(r) => { setRecord(r); setView('home'); }}
+              initial={editingEntry || record}
+              onBack={() => closeRecordScreen(null)}
+              onSave={(r) => closeRecordScreen(r)}
             />
           </div>
         </div>
@@ -1417,7 +1569,7 @@ function AppInner() {
             <HomeHero record={record} onOpenRecord={() => setView('record')} onSeeWeight={() => setTab('log')} />
           ) : null}
           {tab === 'album' ? <AlbumTab /> : null}
-          {tab === 'log' ? <LogTab /> : null}
+          {tab === 'log' ? <LogTab onEditEntry={openEditEntry} /> : null}
           {tab === 'profile' ? <ProfileTab /> : null}
         </div>
         <TabBar tab={tab} setTab={setTab} onOpenRecord={() => { setTab('home'); setView('record'); }} />
@@ -1426,11 +1578,89 @@ function AppInner() {
   );
 }
 
+/* ---- ログイン画面（自分専用アプリなので、ログインするまでSupabaseには一切アクセスしない） ---- */
+function AuthGate({ children }) {
+  const [checking, setChecking] = useState(true);
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    getAccessToken()
+      .then((token) => setLoggedIn(!!token))
+      .finally(() => setChecking(false));
+  }, []);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setError('');
+    try {
+      await authLogin(email, password);
+      setLoggedIn(true);
+    } catch (err) {
+      setError(err.message || 'ログインに失敗しました');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (checking) {
+    return (
+      <div className="app-wrap">
+        <style>{CSS}</style>
+        <div className="phone"><div className="content"><div className="screen"><p className="muted">読み込み中…</p></div></div></div>
+      </div>
+    );
+  }
+
+  if (!loggedIn) {
+    return (
+      <div className="app-wrap">
+        <style>{CSS}</style>
+        <div className="phone">
+          <div className="content">
+            <div className="screen">
+              <header className="page-head">
+                <span className="eyebrow">Login</span>
+                <h1>ログイン</h1>
+              </header>
+              <div className="ruled-card">
+                <PunchHoles />
+                <form className="ruled-card-body profile-form" onSubmit={handleSubmit}>
+                  <label className="profile-field">
+                    <span className="field-label">メールアドレス</span>
+                    <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="username" />
+                  </label>
+                  <label className="profile-field">
+                    <span className="field-label">パスワード</span>
+                    <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+                  </label>
+                  {error ? <p style={{ color: 'var(--danger)', fontSize: 13 }}>{error}</p> : null}
+                  <button className="btn-primary btn-block" type="submit" disabled={submitting}>
+                    {submitting ? 'ログイン中…' : 'ログイン'}
+                  </button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return children;
+}
+
 export default function App() {
   return (
-    <BirdProvider>
-      <AppInner />
-    </BirdProvider>
+    <AuthGate>
+      <BirdProvider>
+        <AppInner />
+      </BirdProvider>
+    </AuthGate>
   );
 }
 
@@ -1502,6 +1732,11 @@ const CSS = `
   color: var(--ink); display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0;
 }
 .record-head h1 { font-family: 'Zen Maru Gothic', sans-serif; font-weight: 900; font-size: 20px; margin: 2px 0 0; }
+.date-picker-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px;
+  border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; background: var(--surface-alt);
+}
+.date-picker-row input { border: none; background: transparent; font-size: 13px; color: var(--ink); font-family: 'Zen Kaku Gothic New', sans-serif; }
 
 /* --- ホーム: 未記録の誘導カード --- */
 .today-prompt { border: none; padding: 0; text-align: left; width: 100%; cursor: pointer; font-family: inherit; }
@@ -1810,6 +2045,7 @@ const CSS = `
 /* --- バインダー風タイムライン（アルバム・記録共通） --- */
 .binder-spine { display: flex; flex-direction: column; gap: 14px; }
 .binder-entry { display: flex; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 0; }
+.binder-entry-clickable { text-align: left; cursor: pointer; width: 100%; padding: 0; font-family: inherit; }
 .binder-entry-body { padding: 12px 14px; flex: 1; }
 .binder-entry-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .binder-date { font-family: 'Zen Maru Gothic', sans-serif; font-weight: 700; font-size: 13px; color: var(--cheek-deep); }
