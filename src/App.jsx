@@ -142,7 +142,7 @@ const CAUTION_GRAMS = 3; // ベースライン±3gを超えたら注意
 
 // AIコメント機能のON/OFFフラグ。ANTHROPIC_API_KEYの設定が済むまではfalseにしておく
 // （trueに変えるだけで「教えてピポ鳥博士」機能が有効になる）
-const AI_COMMENT_ENABLED = false;
+const AI_COMMENT_ENABLED = true;
 const WARN_RATIO = 0.20; // ゲージ表示の両端（±20%）※表示用のスケールのみ、判定には使わない
 
 // 歴代最高・最低・危険ラインは判定には使わず、参考情報として表示するだけ
